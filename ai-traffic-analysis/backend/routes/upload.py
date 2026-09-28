@@ -13,10 +13,11 @@ import uuid
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 from pathlib import Path
 
-from database.db import get_db, DetectionResult, ViolationLog
+from database.db import get_db, DetectionResult, ViolationLog, SignalDecision
 from ml.detector import TrafficDetector, process_image, process_video
 
 router = APIRouter(prefix="/api", tags=["analysis"])
@@ -35,7 +36,9 @@ _detector: TrafficDetector | None = None
 def get_detector() -> TrafficDetector:
     global _detector
     if _detector is None:
-        model_path = os.getenv("MODEL_PATH", "yolov8n.pt")
+        # YOLOv11 default; override via MODEL_PATH env var
+        # yolov8n.pt kept on disk for A/B comparison — not loaded here
+        model_path = os.getenv("MODEL_PATH", "yolo11n.pt")
         _detector = TrafficDetector(model_path)
     return _detector
 
@@ -82,6 +85,9 @@ def _persist_result(db: Session, filename: str, media_type: str, result: dict, o
         signal_timing=result.get("signal_timing"),
         emergency_status=result.get("emergency_status"),
         traffic_alert=result.get("traffic_alert"),
+        # Algorithm 2 + 3 new fields (additive)
+        approach_densities=result.get("approach_densities"),
+        rl_signal_decision=result.get("rl_signal_decision"),
     )
     db.add(db_record)
     db.commit()
@@ -112,6 +118,9 @@ def _build_response(filename: str, media_type: str, result: dict, output_name: s
         "signal_timing": result.get("signal_timing"),
         "emergency_status": result.get("emergency_status"),
         "traffic_alert": result.get("traffic_alert"),
+        # Algorithm 2 + 3 new response fields
+        "approach_densities": result.get("approach_densities"),
+        "rl_signal_decision": result.get("rl_signal_decision"),
     }
 
 
@@ -276,3 +285,119 @@ def get_stats(db: Session = Depends(get_db)):
         "emergency_events": emergency_count,
         "high_traffic_events": high_traffic_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# New Algorithm 2 + 3 endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/density/{result_id}")
+def get_approach_density(result_id: int, db: Session = Depends(get_db)):
+    """
+    GET /api/density/{result_id}
+
+    Returns per-approach (N/E/S/W) density analysis (Algorithm 2) for a result.
+
+    Response shape:
+      {
+        "result_id": int,
+        "approach_densities": {
+          "N": {count, occupancy_ratio, queue_length, density_score,
+                congestion_level, flagged},
+          "E": { ... },
+          "S": { ... },
+          "W": { ... },
+          "_summary": {most_congested, flagged_approaches, threshold_used}
+        }
+      }
+    """
+    import json
+
+    def _parse(field):
+        if field is None:
+            return None
+        if isinstance(field, dict):
+            return field
+        try:
+            return json.loads(field)
+        except Exception:
+            return None
+
+    record = db.query(DetectionResult).filter(DetectionResult.id == result_id).first()
+    if not record:
+        raise HTTPException(404, "Result not found")
+
+    densities = _parse(record.approach_densities)
+    if densities is None:
+        raise HTTPException(
+            404,
+            "No density data for this result — reprocess with the updated pipeline"
+        )
+
+    return {
+        "result_id": result_id,
+        "approach_densities": densities,
+    }
+
+
+@router.get("/signal-decision")
+def get_latest_signal_decision(limit: int = 10, db: Session = Depends(get_db)):
+    """
+    GET /api/signal-decision?limit=10
+
+    Returns the most recent Algorithm 3 RL signal decisions with full reasoning
+    (state vector, Q-values, reward components, phase, green time).
+
+    Response shape:
+      [
+        {
+          "id": int,
+          "intersection_id": str,
+          "phase": str,              # NS_GREEN | EW_GREEN
+          "green_approaches": [str],
+          "red_approaches": [str],
+          "green_time_s": int,
+          "state_vector": [float],   # [d_N, d_E, d_S, d_W, phase_idx]
+          "q_values": {str: float},
+          "reward": float,
+          "reason": str,
+          "approach_densities": { ... },
+          "created_at": str (ISO)
+        },
+        ...
+      ]
+    """
+    import json
+
+    def _parse(field):
+        if field is None:
+            return None
+        try:
+            return json.loads(field) if isinstance(field, str) else field
+        except Exception:
+            return None
+
+    rows = (
+        db.query(SignalDecision)
+        .order_by(SignalDecision.created_at.desc())
+        .limit(max(1, min(limit, 100)))
+        .all()
+    )
+
+    return [
+        {
+            "id":                 r.id,
+            "intersection_id":    r.intersection_id,
+            "phase":              r.phase,
+            "green_approaches":   _parse(r.green_approaches),
+            "red_approaches":     _parse(r.red_approaches),
+            "green_time_s":       r.green_time_s,
+            "state_vector":       _parse(r.state_vector),
+            "q_values":           _parse(r.q_values),
+            "reward":             r.reward,
+            "reason":             r.reason,
+            "approach_densities": _parse(r.approach_densities),
+            "created_at":         r.created_at.isoformat(),
+        }
+        for r in rows
+    ]

@@ -35,7 +35,7 @@ echo Servers are starting in separate windows:
 echo ============================================
 echo Backend:  http://localhost:8000
 echo API Docs: http://localhost:8000/docs
-echo Frontend: http://localhost:5173 (if Node.js installed)
+echo Frontend: http://localhost:3000 (if Node.js installed)
 echo.
 echo Close the terminal windows to stop the servers.
 echo ============================================

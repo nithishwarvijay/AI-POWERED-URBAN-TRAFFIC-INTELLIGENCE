@@ -34,3 +34,10 @@ Thumbs.db
 # Environment variables
 .env
 .env.*
+
+# Uploads & temporary runtime files
+uploads/
+**/uploads/*
+!**/uploads/.gitkeep
+!**/uploads/processed/.gitkeep
+

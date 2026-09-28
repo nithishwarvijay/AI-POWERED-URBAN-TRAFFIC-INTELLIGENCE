@@ -1,6 +1,6 @@
 @echo off
 echo Installing dependencies...
-venv\Scripts\pip install fastapi uvicorn python-multipart opencv-python-headless ultralytics Pillow sqlalchemy python-dotenv numpy aiofiles pydantic
+venv\Scripts\pip install -r requirements.txt --quiet
 
 echo.
 echo Starting FastAPI server...
